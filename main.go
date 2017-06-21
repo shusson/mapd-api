@@ -76,7 +76,12 @@ func modifySession(handler http.Handler, sessionId string) http.Handler {
 			b := string(body[:])
 			re := regexp.MustCompile(`(\[\d,")(\w*)(",\d,\d,{"1":{"str":")(\w*)(".*},"2".*,"3".*,"4":{"str":")(\d*)("}.*,"5".*}\])`)
 			repl := fmt.Sprintf("${1}${2}${3}%s${5}%d${7}", sessionId, nonce)
-			body = []byte(re.ReplaceAllString(b, repl))
+			b = re.ReplaceAllString(b, repl)
+			body = []byte(b)
+			// when writing a request the http lib ignores the request header and reads from the ContentLength field
+			// http://tip.golang.org/pkg/net/http/#Request.Write
+			// https://github.com/golang/go/issues/7682
+			r.ContentLength = int64(len(b))
 		}
 		r.Body = ioutil.NopCloser(bytes.NewBuffer(body))
 		handler.ServeHTTP(w, r)
