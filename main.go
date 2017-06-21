@@ -16,6 +16,8 @@ import (
 	"os"
 	"strings"
 	"time"
+	"syscall"
+	"os/signal"
 )
 
 type mapdOptions struct {
@@ -48,19 +50,25 @@ func main() {
 	protocolFactory := thrift.NewTJSONProtocolFactory()
 	transportFactory := thrift.NewTBufferedTransportFactory(bufferSize)
 
-	var mapdClient *mapd.MapDClient
-	var sessionId mapd.TSessionId
-	var err error
-	err = retry(60, 2 * time.Second, func() error {
+	mapdClient, sessionId, err := retry(60, 2 * time.Second, func() (*mapd.MapDClient, mapd.TSessionId, error) {
 		log.Println("connecting to mapd server...")
-		mapdClient, sessionId, err = connectToMapd(transportFactory, protocolFactory, mapdOptions{mapdUrl, mapdUser, mapdDb, mapdPwd})
-		return err
+		return connectToMapd(transportFactory, protocolFactory, mapdOptions{mapdUrl, mapdUser, mapdDb, mapdPwd})
 	})
 
 	if err != nil || sessionId == "" {
 		log.Fatal("failed to connect to mapd server")
 	}
 	log.Println("connected to mapd server: ", sessionId)
+
+	c := make(chan os.Signal, 2)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		sig := <-c
+		log.Println("Terminating due to signal: ", sig.String())
+		mapdClient.Disconnect(sessionId)
+		os.Exit(1)
+	}()
+
 	defer mapdClient.Disconnect(sessionId)
 
 	proxy := sessionProxy(mapdUrl, string(sessionId))
@@ -128,15 +136,17 @@ func connectToMapd(transportFactory thrift.TTransportFactory, protocolFactory th
 	return client, sessionId, err
 }
 
-func retry(attempts int, sleep time.Duration, action func() error) error {
+func retry(attempts int, sleep time.Duration, action func() (*mapd.MapDClient, mapd.TSessionId, error)) (*mapd.MapDClient, mapd.TSessionId, error) {
 	var err error
+	var mapdClient *mapd.MapDClient
+	var sessionId mapd.TSessionId
 	for i := 0; i < attempts; i++ {
-		err = action()
+		mapdClient, sessionId, err = action()
 		if err == nil {
-			return nil
+			return mapdClient, sessionId, err
 		}
 		time.Sleep(sleep)
 		log.Println("retrying action after error: ", err)
 	}
-	return err
+	return mapdClient, sessionId, err
 }
