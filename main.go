@@ -74,9 +74,9 @@ func modifySession(handler http.Handler, sessionId string) http.Handler {
 		if err == nil {
 			nonce++
 			b := string(body[:])
-			re := regexp.MustCompile(`(\[\d,")(\w*)"(,\d,\d,{"1":{"str":")(\w*)(".*},"2".*,"3".*,"4":{"str":")(\d*)("}.*,"5".*}\])`)
+			re := regexp.MustCompile(`(\[\d,")(\w*)(",\d,\d,{"1":{"str":")(\w*)(".*},"2".*,"3".*,"4":{"str":")(\d*)("}.*,"5".*}\])`)
 			repl := fmt.Sprintf("${1}${2}${3}%s${5}%d${7}", sessionId, nonce)
-			b = re.ReplaceAllString(b, repl)
+			body = []byte(re.ReplaceAllString(b, repl))
 		}
 		r.Body = ioutil.NopCloser(bytes.NewBuffer(body))
 		handler.ServeHTTP(w, r)
