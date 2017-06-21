@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"flag"
 	"os"
+	"strings"
+	"time"
 )
 
 type mapdOptions struct {
@@ -24,7 +26,6 @@ type mapdOptions struct {
 }
 
 func main() {
-
 	var mapdUrl string
 	var mapdUser string
 	var mapdDb string
@@ -47,13 +48,23 @@ func main() {
 	protocolFactory := thrift.NewTJSONProtocolFactory()
 	transportFactory := thrift.NewTBufferedTransportFactory(bufferSize)
 
-	mapdClient, sessionId, err := connectToMapd(transportFactory, protocolFactory, mapdOptions{mapdUrl, mapdUser, mapdDb, mapdPwd})
+	var mapdClient *mapd.MapDClient
+	var sessionId mapd.TSessionId
+	var err error
+	err = retry(60, 2 * time.Second, func() error {
+		log.Println("connecting to mapd server...")
+		mapdClient, sessionId, err = connectToMapd(transportFactory, protocolFactory, mapdOptions{mapdUrl, mapdUser, mapdDb, mapdPwd})
+		return err
+	})
+
 	if err != nil || sessionId == "" {
-		log.Fatal("failed to get sessionId")
+		log.Fatal("failed to connect to mapd server")
 	}
+	log.Println("connected to mapd server: ", sessionId)
 	defer mapdClient.Disconnect(sessionId)
 
 	proxy := sessionProxy(mapdUrl, string(sessionId))
+
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", httpPort), proxy))
 }
 
@@ -74,14 +85,16 @@ func modifySession(handler http.Handler, sessionId string) http.Handler {
 		if err == nil {
 			nonce++
 			b := string(body[:])
-			re := regexp.MustCompile(`(\[\d,")(\w*)(",\d,\d,{"1":{"str":")(\w*)(".*},"2".*,"3".*,"4":{"str":")(\d*)("}.*,"5".*}\])`)
-			repl := fmt.Sprintf("${1}${2}${3}%s${5}%d${7}", sessionId, nonce)
-			b = re.ReplaceAllString(b, repl)
-			body = []byte(b)
-			// when writing a request the http lib ignores the request header and reads from the ContentLength field
-			// http://tip.golang.org/pkg/net/http/#Request.Write
-			// https://github.com/golang/go/issues/7682
-			r.ContentLength = int64(len(b))
+			if strings.Contains(b, "sql_execute") {
+				re := regexp.MustCompile(`(\[\d,")(\w*)(",\d,\d,{"1":{"str":")(\w*)(".*},"2".*,"3".*,"4":{"str":")(\d*)("}.*,"5".*}\])`)
+				repl := fmt.Sprintf("${1}${2}${3}%s${5}%d${7}", sessionId, nonce)
+				b = re.ReplaceAllString(b, repl)
+				body = []byte(b)
+				// when writing a request the http lib ignores the request header and reads from the ContentLength field
+				// http://tip.golang.org/pkg/net/http/#Request.Write
+				// https://github.com/golang/go/issues/7682
+				r.ContentLength = int64(len(b))
+			}
 		}
 		r.Body = ioutil.NopCloser(bytes.NewBuffer(body))
 		handler.ServeHTTP(w, r)
@@ -113,4 +126,17 @@ func connectToMapd(transportFactory thrift.TTransportFactory, protocolFactory th
 		return nil, "", err
 	}
 	return client, sessionId, err
+}
+
+func retry(attempts int, sleep time.Duration, action func() error) error {
+	var err error
+	for i := 0; i < attempts; i++ {
+		err = action()
+		if err == nil {
+			return nil
+		}
+		time.Sleep(sleep)
+		log.Println("retrying action after error: ", err)
+	}
+	return err
 }
