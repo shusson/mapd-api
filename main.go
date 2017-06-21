@@ -1,108 +1,111 @@
 package main
 
 import (
-	"fmt"
-	"github.com/gorilla/mux"
+	"git.apache.org/thrift.git/lib/go/thrift"
+	"github.com/shusson/mapd-api/thrift/e745367/mapd"
+	"net/url"
+	"log"
+	"net/http/httputil"
 	"net/http"
+	"io/ioutil"
 	"bytes"
 	"errors"
-	"git.apache.org/thrift.git/lib/go/thrift"
-	"github.com/shusson/mapd-api/mapd"
+	"regexp"
+	"fmt"
+	"flag"
+	"os"
 )
+
+type mapdOptions struct {
+	Url string
+	User string
+	Db string
+	Pwd string
+}
 
 func main() {
 
-	protocolFactory := thrift.NewTSimpleJSONProtocolFactory()
-	transportFactory := thrift.NewTBufferedTransportFactory(8192)
+	var mapdUrl string
+	var mapdUser string
+	var mapdDb string
+	var mapdPwd string
+	var httpPort int
+	var bufferSize int
+	flag.StringVar(&mapdUrl, "url", "http://127.0.0.1:80", "url to mapd-core server")
+	flag.StringVar(&mapdUser, "user", "mapd", "mapd user")
+	flag.StringVar(&mapdDb, "db", "mapd", "mapd database")
+	flag.StringVar(&mapdPwd, "pass", "HyperInteractive", "mapd pwd")
+	flag.IntVar(&httpPort, "http-port", 4000, "port to listen to incoming http connections")
+	flag.IntVar(&bufferSize, "b", 8192, "thrift transport buffer size")
 
-	//if *framed {
-	//	transportFactory = thrift.NewTFramedTransportFactory(transportFactory)
-	//}
-
-	if err := runClient(transportFactory, protocolFactory, "127.0.0.1:80", false); err != nil {
-		fmt.Println("error running client:", err)
+	flag.Usage = func() {
+		fmt.Printf("Usage of %s:\n", os.Args[0])
+		flag.PrintDefaults()
 	}
+	flag.Parse()
+
+	protocolFactory := thrift.NewTJSONProtocolFactory()
+	transportFactory := thrift.NewTBufferedTransportFactory(bufferSize)
+
+	mapdClient, sessionId, err := connectToMapd(transportFactory, protocolFactory, mapdOptions{mapdUrl, mapdUser, mapdDb, mapdPwd})
+	if err != nil || sessionId == "" {
+		log.Fatal("failed to get sessionId")
+	}
+	defer mapdClient.Disconnect(sessionId)
+
+	proxy := sessionProxy(mapdUrl, string(sessionId))
+	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", httpPort), proxy))
 }
 
-func Index(router *mux.Router, url string) http.HandlerFunc {
-	fn := func(w http.ResponseWriter, r *http.Request) {
-		var jsonStr = []byte(`[1,"connect",1,0,{"1":{"str":"mapd"},"2":{"str":"HyperInteractive"},"3":{"str":"mapd"}}]`)
-		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonStr))
-
-		if check(err, w) != nil {
-			return
-		}
-		req.Header.Set("Accept", "application/vnd.apache.thrift.json; charset=utf-8")
-		req.Header.Set("Content-Type", "application/vnd.apache.thrift.json; charset=UTF-8")
-		req.Header.Set("Content-Length", "88")
-
-		client := &http.Client{}
-		resp, err := client.Do(req)
-		if check(err, w) != nil {
-			return
-		}
-		defer resp.Body.Close()
-
-		var status error
-		if resp.StatusCode != 200 {
-			status = errors.New(resp.Status)
-		}
-		if check(status, w) != nil {
-			return
-		}
-		w.Header().Set("Server", "Mapd healthcheck")
-		w.WriteHeader(200)
-		w.Write([]byte("OK"))
-	}
-	return http.HandlerFunc(fn)
-}
-
-func check(err error, w http.ResponseWriter) error {
+func sessionProxy(remoteUrl string, sessionId string) http.Handler {
+	serverUrl, err := url.Parse(remoteUrl)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		log.Fatal("URL failed to parse")
 	}
-	return err
+	reverseProxy := httputil.NewSingleHostReverseProxy(serverUrl)
+	modified := modifySession(reverseProxy, sessionId)
+	return modified
 }
 
-
-func handleClient(client *mapd.MapDClient) (err error) {
-	sessionId, err := client.Connect("mapd", "HyperInteractive", "mapd")
-	println(sessionId)
-	if err != nil {
-		fmt.Println("Unable to connect:", err)
-		return err
-	}
-	return err
+func modifySession(handler http.Handler, sessionId string) http.Handler {
+	nonce := 0
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := ioutil.ReadAll(r.Body)
+		if err == nil {
+			nonce++
+			b := string(body[:])
+			re := regexp.MustCompile(`(\[\d,")(\w*)"(,\d,\d,{"1":{"str":")(\w*)(".*},"2".*,"3".*,"4":{"str":")(\d*)("}.*,"5".*}\])`)
+			repl := fmt.Sprintf("${1}${2}${3}%s${5}%d${7}", sessionId, nonce)
+			b = re.ReplaceAllString(b, repl)
+		}
+		r.Body = ioutil.NopCloser(bytes.NewBuffer(body))
+		handler.ServeHTTP(w, r)
+	})
 }
 
-func runClient(transportFactory thrift.TTransportFactory, protocolFactory thrift.TProtocolFactory, addr string, secure bool) error {
-	//var transport thrift.TTransport
-	//var err error
-	//if secure {
-	//	cfg := new(tls.Config)
-	//	cfg.InsecureSkipVerify = true
-	//	transport, err = thrift.NewTSSLSocket(addr, cfg)
-	//} else {
-	//	transport, err = thrift.NewTSocket(addr)
-	//}
-	var transport thrift.TTransport
-	//noinspection ALL
-	transport, err := thrift.NewTSocket(addr)
+func connectToMapd(transportFactory thrift.TTransportFactory, protocolFactory thrift.TProtocolFactory, options mapdOptions) (*mapd.MapDClient, mapd.TSessionId, error) {
+	socket, err := thrift.NewTHttpPostClient(options.Url)
+	if socket == nil {
+		return nil, "", errors.New("nil transport")
+	}
 	if err != nil {
-		fmt.Println("Error opening socket:", err)
-		return err
+		return nil, "", err
+	}
+	transport, err := transportFactory.GetTransport(socket)
+	if err != nil {
+		return nil, "", err
 	}
 	if transport == nil {
-		return fmt.Errorf("Error opening socket, got nil transport. Is server available?")
-	}
-	transport, err = transportFactory.GetTransport(transport)
-	if transport == nil {
-		return fmt.Errorf("Error from transportFactory.GetTransport(), got nil transport. Is server available?")
+		return nil, "", errors.New("nil transport")
 	}
 	defer transport.Close()
 	if err := transport.Open(); err != nil {
-		return err
+		return nil, "", err
 	}
-
-	return handleClient(mapd.NewMapDClientFactory(transport, protocolFactory))
+	client := mapd.NewMapDClientFactory(transport, protocolFactory)
+	sessionId, err := client.Connect(options.User, options.Pwd, options.Db)
+	if err != nil {
+		return nil, "", err
+	}
+	return client, sessionId, err
 }

@@ -1,2 +1,2 @@
-# mapd-healthcheck
-simple mapd healthcheck
+# mapd-api
+
