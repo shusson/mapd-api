@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"io/ioutil"
 	"bytes"
-	"errors"
 	"regexp"
 	"fmt"
 	"flag"
@@ -20,39 +19,22 @@ import (
 	"os/signal"
 )
 
-type mapdOptions struct {
-	Url string
-	User string
-	Db string
-	Pwd string
+type options struct {
+	url string
+	user string
+	db string
+	pwd string
+	httpPort int
+	bufferSize int
 }
 
 func main() {
-	var mapdUrl string
-	var mapdUser string
-	var mapdDb string
-	var mapdPwd string
-	var httpPort int
-	var bufferSize int
-	flag.StringVar(&mapdUrl, "url", "http://127.0.0.1:80", "url to mapd-core server")
-	flag.StringVar(&mapdUser, "user", "mapd", "mapd user")
-	flag.StringVar(&mapdDb, "db", "mapd", "mapd database")
-	flag.StringVar(&mapdPwd, "pass", "HyperInteractive", "mapd pwd")
-	flag.IntVar(&httpPort, "http-port", 4000, "port to listen to incoming http connections")
-	flag.IntVar(&bufferSize, "b", 8192, "thrift transport buffer size")
 
-	flag.Usage = func() {
-		fmt.Printf("Usage of %s:\n", os.Args[0])
-		flag.PrintDefaults()
-	}
-	flag.Parse()
+	options := getOpts()
 
-	protocolFactory := thrift.NewTJSONProtocolFactory()
-	transportFactory := thrift.NewTBufferedTransportFactory(bufferSize)
-
-	mapdClient, sessionId, err := retry(60, 2 * time.Second, func() (*mapd.MapDClient, mapd.TSessionId, error) {
+	client, sessionId, err := retry(60, 2 * time.Second, func() (*mapd.MapDClient, mapd.TSessionId, error) {
 		log.Println("connecting to mapd server...")
-		return connectToMapd(transportFactory, protocolFactory, mapdOptions{mapdUrl, mapdUser, mapdDb, mapdPwd})
+		return connectToMapd(options)
 	})
 
 	if err != nil || sessionId == "" {
@@ -65,15 +47,15 @@ func main() {
 	go func() {
 		sig := <-c
 		log.Println("Terminating due to signal: ", sig.String())
-		mapdClient.Disconnect(sessionId)
+		client.Disconnect(sessionId)
+		client.Transport.Close()
 		os.Exit(1)
 	}()
 
-	defer mapdClient.Disconnect(sessionId)
-
-	proxy := sessionProxy(mapdUrl, string(sessionId))
-
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", httpPort), proxy))
+	defer client.Disconnect(sessionId)
+	defer client.Transport.Close()
+	proxy := sessionProxy(options.url, string(sessionId))
+	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", options.httpPort), proxy))
 }
 
 func sessionProxy(remoteUrl string, sessionId string) http.Handler {
@@ -109,11 +91,10 @@ func modifySession(handler http.Handler, sessionId string) http.Handler {
 	})
 }
 
-func connectToMapd(transportFactory thrift.TTransportFactory, protocolFactory thrift.TProtocolFactory, options mapdOptions) (*mapd.MapDClient, mapd.TSessionId, error) {
-	socket, err := thrift.NewTHttpPostClient(options.Url)
-	if socket == nil {
-		return nil, "", errors.New("nil transport")
-	}
+func connectToMapd(options options) (*mapd.MapDClient, mapd.TSessionId, error) {
+	protocolFactory := thrift.NewTJSONProtocolFactory()
+	transportFactory := thrift.NewTBufferedTransportFactory(options.bufferSize)
+	socket, err := thrift.NewTHttpPostClient(options.url)
 	if err != nil {
 		return nil, "", err
 	}
@@ -121,15 +102,11 @@ func connectToMapd(transportFactory thrift.TTransportFactory, protocolFactory th
 	if err != nil {
 		return nil, "", err
 	}
-	if transport == nil {
-		return nil, "", errors.New("nil transport")
-	}
-	defer transport.Close()
 	if err := transport.Open(); err != nil {
 		return nil, "", err
 	}
 	client := mapd.NewMapDClientFactory(transport, protocolFactory)
-	sessionId, err := client.Connect(options.User, options.Pwd, options.Db)
+	sessionId, err := client.Connect(options.user, options.pwd, options.db)
 	if err != nil {
 		return nil, "", err
 	}
@@ -149,4 +126,26 @@ func retry(attempts int, sleep time.Duration, action func() (*mapd.MapDClient, m
 		log.Println("retrying action after error: ", err)
 	}
 	return mapdClient, sessionId, err
+}
+
+func getOpts() options {
+	var mapdUrl string
+	var mapdUser string
+	var mapdDb string
+	var mapdPwd string
+	var httpPort int
+	var bufferSize int
+	flag.StringVar(&mapdUrl, "url", "http://127.0.0.1:80", "url to mapd-core server")
+	flag.StringVar(&mapdUser, "user", "mapd", "mapd user")
+	flag.StringVar(&mapdDb, "db", "mapd", "mapd database")
+	flag.StringVar(&mapdPwd, "pass", "HyperInteractive", "mapd pwd")
+	flag.IntVar(&httpPort, "http-port", 4000, "port to listen to incoming http connections")
+	flag.IntVar(&bufferSize, "b", 8192, "thrift transport buffer size")
+
+	flag.Usage = func() {
+		fmt.Printf("Usage of %s:\n", os.Args[0])
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+	return options{mapdUrl, mapdUser, mapdDb, mapdPwd, httpPort, bufferSize}
 }
