@@ -19,7 +19,7 @@ import (
 	"os/signal"
 )
 
-type options struct {
+type opts struct {
 	url string
 	user string
 	db string
@@ -30,18 +30,26 @@ type options struct {
 
 func main() {
 
-	options := getOpts()
+	options := options()
 
 	client, sessionId, err := retry(60, 2 * time.Second, func() (*mapd.MapDClient, mapd.TSessionId, error) {
 		log.Println("connecting to mapd server...")
 		return connectToMapd(options)
 	})
-
 	if err != nil || sessionId == "" {
 		log.Fatal("failed to connect to mapd server")
 	}
 	log.Println("connected to mapd server: ", sessionId)
+	defer client.Disconnect(sessionId)
+	defer client.Transport.Close()
 
+	handleSignals(client, sessionId)
+
+	proxy := sessionProxy(options.url, string(sessionId))
+	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", options.httpPort), proxy))
+}
+
+func handleSignals(client *mapd.MapDClient, sessionId mapd.TSessionId) {
 	c := make(chan os.Signal, 2)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -51,11 +59,6 @@ func main() {
 		client.Transport.Close()
 		os.Exit(1)
 	}()
-
-	defer client.Disconnect(sessionId)
-	defer client.Transport.Close()
-	proxy := sessionProxy(options.url, string(sessionId))
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", options.httpPort), proxy))
 }
 
 func sessionProxy(remoteUrl string, sessionId string) http.Handler {
@@ -91,7 +94,7 @@ func modifySession(handler http.Handler, sessionId string) http.Handler {
 	})
 }
 
-func connectToMapd(options options) (*mapd.MapDClient, mapd.TSessionId, error) {
+func connectToMapd(options opts) (*mapd.MapDClient, mapd.TSessionId, error) {
 	protocolFactory := thrift.NewTJSONProtocolFactory()
 	transportFactory := thrift.NewTBufferedTransportFactory(options.bufferSize)
 	socket, err := thrift.NewTHttpPostClient(options.url)
@@ -128,7 +131,7 @@ func retry(attempts int, sleep time.Duration, action func() (*mapd.MapDClient, m
 	return mapdClient, sessionId, err
 }
 
-func getOpts() options {
+func options() opts {
 	var mapdUrl string
 	var mapdUser string
 	var mapdDb string
@@ -147,5 +150,5 @@ func getOpts() options {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-	return options{mapdUrl, mapdUser, mapdDb, mapdPwd, httpPort, bufferSize}
+	return opts{mapdUrl, mapdUser, mapdDb, mapdPwd, httpPort, bufferSize}
 }
