@@ -87,6 +87,12 @@ func modifySession(handler http.Handler, sessionId string) http.Handler {
 				// http://tip.golang.org/pkg/net/http/#Request.Write
 				// https://github.com/golang/go/issues/7682
 				r.ContentLength = int64(len(b))
+			} else if strings.Contains(b, "get_table_details") {
+				re := regexp.MustCompile(`(.*{"str":")(\w{32})(.*)`)
+				repl := fmt.Sprintf("${1}%s${3}", sessionId)
+				b = re.ReplaceAllString(b, repl)
+				body = []byte(b)
+				r.ContentLength = int64(len(b))
 			}
 		}
 		r.Body = ioutil.NopCloser(bytes.NewBuffer(body))
