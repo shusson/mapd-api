@@ -18,35 +18,48 @@ import (
 	"syscall"
 	"os/signal"
 	"github.com/gorilla/mux"
+	"encoding/json"
 )
 
 type opts struct {
-	url string
-	user string
-	db string
-	pwd string
-	httpPort int
+	url        string
+	user       string
+	db         string
+	pwd        string
+	httpPort   int
 	bufferSize int
 }
 
 type MapDCon struct {
-	client *mapd.MapDClient
+	client  *mapd.MapDClient
 	session mapd.TSessionId
 	options opts
+}
+
+type TableInfo struct {
+	Name string `json:"name"`
+	Count int64 `json:"count"`
+}
+
+type MapDConInfo struct {
+	Version string `json:"version"`
+	StartTime int64 `json:"start_time"`
+	ReadOnly bool `json:"read_only"`
+	Tables []TableInfo `json:"tables"`
 }
 
 func main() {
 
 	options := options()
 
-	con, err := retry(60, 2 * time.Second, func() (*MapDCon, error) {
+	con, err := retry(60, 2*time.Second, func() (*MapDCon, error) {
 		log.Println("connecting to mapd server...")
 		return connectToMapD(options)
 	})
 	if err != nil || con.session == "" {
 		log.Fatal("failed to connect to mapd server")
 	}
-	log.Println("connected to mapd server: ", con.session)
+
 	defer con.client.Disconnect(con.session)
 	defer con.client.Transport.Close()
 
@@ -120,41 +133,72 @@ func connectToMapD(options opts) (*MapDCon, error) {
 		return nil, err
 	}
 
-	return &MapDCon{client, sessionId, options}, err
+	log.Println("connected to mapd server: ", sessionId)
+	con := &MapDCon{client, sessionId, options}
+	connectionInfo(con)
+	info, err := connectionInfo(con)
+	if err != nil {
+		return nil, err
+	}
+	jInfo, err := json.Marshal(info)
+	if err != nil {
+		return nil, err
+	}
+	log.Println(string(jInfo))
+
+	return con, err
 }
 
 func healthCheck(con *MapDCon) http.HandlerFunc {
-	fn := func(w http.ResponseWriter, r *http.Request) {
-		log.Println("Performing Healthcheck...")
-		if con.session == "" {
-			em := "Missing SessionId"
-			http.Error(w, em, 500)
-			log.Println("Healthcheck failed: " + em)
-		} else {
-			tbs, err := con.client.GetTables(con.session)
-			if err != nil {
-				http.Error(w, err.Error(), 500)
-				return
-			}
-			con.client.GetTables(con.session)
-			for i := 0; i < len(tbs); i++ {
-				res, err := con.client.SqlExecute(con.session, "SELECT COUNT(*) FROM " + tbs[i], true, "0", 1)
-				if err != nil {
-					http.Error(w, err.Error(), 500)
-					return
-				}
-				numRows := len(res.RowSet.Columns[0].Nulls)
-				numCols := len(res.RowSet.RowDesc)
-				for r := 0; r < numRows; r++ {
-					for c := 0; c < numCols; c++ {
-						fmt.Fprintf(w, "%s: %d\n", tbs[i], res.RowSet.Columns[c].Data.IntCol[r])
-					}
-				}
-			}
-			fmt.Fprintln(w, "OK")
+	handleError := func(w http.ResponseWriter, err error) error {
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			log.Println("Healthcheck failed: " + err.Error())
 		}
+		return err
+	}
+
+	fn := func(w http.ResponseWriter, r *http.Request) {
+
+		info, err := connectionInfo(con)
+		if handleError(w, err) != nil {
+			return
+		}
+		jInfo, err := json.Marshal(info)
+		if handleError(w, err) != nil {
+			return
+		}
+		fmt.Fprintln(w, string(jInfo))
+		log.Println("Healthcheck passed - " + string(jInfo))
 	}
 	return http.HandlerFunc(fn)
+}
+
+func connectionInfo(con *MapDCon) (*MapDConInfo, error) {
+	serverInfo, err := con.client.GetServerStatus(con.session)
+	if err != nil {
+		return nil, err
+	}
+	tbs, err := con.client.GetTables(con.session)
+	if err != nil {
+		return nil, err
+	}
+	con.client.GetTables(con.session)
+	hcr := &MapDConInfo{ReadOnly: serverInfo.ReadOnly, StartTime: serverInfo.StartTime, Tables: []TableInfo{}, Version: serverInfo.Version}
+	for i := 0; i < len(tbs); i++ {
+		res, err := con.client.SqlExecute(con.session, "SELECT COUNT(*) FROM "+tbs[i], true, "0", 1)
+		if err != nil {
+			return nil, err
+		}
+		numRows := len(res.RowSet.Columns[0].Nulls)
+		numCols := len(res.RowSet.RowDesc)
+		for r := 0; r < numRows; r++ {
+			for c := 0; c < numCols; c++ {
+				hcr.Tables = append(hcr.Tables, TableInfo{Count: res.RowSet.Columns[c].Data.IntCol[r], Name: tbs[i]})
+			}
+		}
+	}
+	return hcr, nil
 }
 
 func handleSystemSignals(con *MapDCon) {
