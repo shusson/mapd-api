@@ -36,16 +36,10 @@ type MapDCon struct {
 	options opts
 }
 
-type TableInfo struct {
-	Name string `json:"name"`
-	Count int64 `json:"count"`
-}
-
 type MapDConInfo struct {
 	Version string `json:"version"`
 	StartTime int64 `json:"start_time"`
 	ReadOnly bool `json:"read_only"`
-	Tables []TableInfo `json:"tables"`
 }
 
 func main() {
@@ -179,24 +173,7 @@ func connectionInfo(con *MapDCon) (*MapDConInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	tbs, err := con.client.GetTables(con.session)
-	if err != nil {
-		return nil, err
-	}
-	hcr := &MapDConInfo{ReadOnly: serverInfo.ReadOnly, StartTime: serverInfo.StartTime, Tables: []TableInfo{}, Version: serverInfo.Version}
-	for i := 0; i < len(tbs); i++ {
-		res, err := con.client.SqlExecute(con.session, "SELECT COUNT(*) FROM " + tbs[i], true, "0", 1)
-		if err != nil {
-			return nil, err
-		}
-		numRows := len(res.RowSet.Columns[0].Nulls)
-		numCols := len(res.RowSet.RowDesc)
-		for r := 0; r < numRows; r++ {
-			for c := 0; c < numCols; c++ {
-				hcr.Tables = append(hcr.Tables, TableInfo{Count: res.RowSet.Columns[c].Data.IntCol[r], Name: tbs[i]})
-			}
-		}
-	}
+	hcr := &MapDConInfo{ReadOnly: serverInfo.ReadOnly, StartTime: serverInfo.StartTime, Version: serverInfo.Version}
 	return hcr, nil
 }
 
