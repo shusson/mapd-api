@@ -183,10 +183,9 @@ func connectionInfo(con *MapDCon) (*MapDConInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	con.client.GetTables(con.session)
 	hcr := &MapDConInfo{ReadOnly: serverInfo.ReadOnly, StartTime: serverInfo.StartTime, Tables: []TableInfo{}, Version: serverInfo.Version}
 	for i := 0; i < len(tbs); i++ {
-		res, err := con.client.SqlExecute(con.session, "SELECT COUNT(*) FROM "+tbs[i], true, "0", 1)
+		res, err := con.client.SqlExecute(con.session, "SELECT COUNT(*) FROM " + tbs[i], true, "0", 1)
 		if err != nil {
 			return nil, err
 		}
