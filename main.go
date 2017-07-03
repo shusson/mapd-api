@@ -17,6 +17,7 @@ import (
 	"time"
 	"syscall"
 	"os/signal"
+	"github.com/gorilla/mux"
 )
 
 type opts struct {
@@ -28,59 +29,58 @@ type opts struct {
 	bufferSize int
 }
 
+type MapDCon struct {
+	client *mapd.MapDClient
+	session mapd.TSessionId
+	options opts
+}
+
 func main() {
 
 	options := options()
 
-	client, sessionId, err := retry(60, 2 * time.Second, func() (*mapd.MapDClient, mapd.TSessionId, error) {
+	con, err := retry(60, 2 * time.Second, func() (*MapDCon, error) {
 		log.Println("connecting to mapd server...")
-		return connectToMapd(options)
+		return connectToMapD(options)
 	})
-	if err != nil || sessionId == "" {
+	if err != nil || con.session == "" {
 		log.Fatal("failed to connect to mapd server")
 	}
-	log.Println("connected to mapd server: ", sessionId)
-	defer client.Disconnect(sessionId)
-	defer client.Transport.Close()
+	log.Println("connected to mapd server: ", con.session)
+	defer con.client.Disconnect(con.session)
+	defer con.client.Transport.Close()
 
-	handleSignals(client, sessionId)
+	handleSystemSignals(con)
 
-	proxy := sessionProxy(options.url, string(sessionId))
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", options.httpPort), proxy))
+	r := mux.NewRouter()
+	r.HandleFunc("/healthcheck", healthCheck(con))
+	r.HandleFunc("/", sessionProxy(con))
+	http.Handle("/", r)
+
+	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", options.httpPort), r))
 }
 
-func handleSignals(client *mapd.MapDClient, sessionId mapd.TSessionId) {
-	c := make(chan os.Signal, 2)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		sig := <-c
-		log.Println("Terminating due to signal: ", sig.String())
-		client.Disconnect(sessionId)
-		client.Transport.Close()
-		os.Exit(1)
-	}()
-}
-
-func sessionProxy(remoteUrl string, sessionId string) http.Handler {
-	serverUrl, err := url.Parse(remoteUrl)
+func sessionProxy(con *MapDCon) http.HandlerFunc {
+	serverUrl, err := url.Parse(con.options.url)
 	if err != nil {
 		log.Fatal("URL failed to parse")
 	}
 	reverseProxy := httputil.NewSingleHostReverseProxy(serverUrl)
-	modified := modifySession(reverseProxy, sessionId)
-	return modified
+	modified := modifySession(reverseProxy, con)
+
+	return http.HandlerFunc(modified)
 }
 
-func modifySession(handler http.Handler, sessionId string) http.Handler {
+func modifySession(handler http.Handler, con *MapDCon) http.HandlerFunc {
 	nonce := 0
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
 		body, err := ioutil.ReadAll(r.Body)
 		if err == nil {
 			nonce++
 			b := string(body[:])
 			if strings.Contains(b, "sql_execute") {
 				re := regexp.MustCompile(`(\[\d,")(\w*)(",\d,\d,{"1":{"str":")(\w*)(".*},"2".*,"3".*,"4":{"str":")(\d*)("}.*,"5".*}\])`)
-				repl := fmt.Sprintf("${1}${2}${3}%s${5}%d${7}", sessionId, nonce)
+				repl := fmt.Sprintf("${1}${2}${3}%s${5}%d${7}", con.session, nonce)
 				b = re.ReplaceAllString(b, repl)
 				body = []byte(b)
 				// when writing a request the http lib ignores the request header and reads from the ContentLength field
@@ -89,7 +89,7 @@ func modifySession(handler http.Handler, sessionId string) http.Handler {
 				r.ContentLength = int64(len(b))
 			} else if strings.Contains(b, "get_table_details") {
 				re := regexp.MustCompile(`(.*{"str":")(\w{32})(.*)`)
-				repl := fmt.Sprintf("${1}%s${3}", sessionId)
+				repl := fmt.Sprintf("${1}%s${3}", con.session)
 				b = re.ReplaceAllString(b, repl)
 				body = []byte(b)
 				r.ContentLength = int64(len(b))
@@ -97,44 +97,90 @@ func modifySession(handler http.Handler, sessionId string) http.Handler {
 		}
 		r.Body = ioutil.NopCloser(bytes.NewBuffer(body))
 		handler.ServeHTTP(w, r)
-	})
+	}
 }
 
-func connectToMapd(options opts) (*mapd.MapDClient, mapd.TSessionId, error) {
+func connectToMapD(options opts) (*MapDCon, error) {
 	protocolFactory := thrift.NewTJSONProtocolFactory()
 	transportFactory := thrift.NewTBufferedTransportFactory(options.bufferSize)
 	socket, err := thrift.NewTHttpPostClient(options.url)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	transport, err := transportFactory.GetTransport(socket)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	if err := transport.Open(); err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	client := mapd.NewMapDClientFactory(transport, protocolFactory)
 	sessionId, err := client.Connect(options.user, options.pwd, options.db)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
-	return client, sessionId, err
+
+	return &MapDCon{client, sessionId, options}, err
 }
 
-func retry(attempts int, sleep time.Duration, action func() (*mapd.MapDClient, mapd.TSessionId, error)) (*mapd.MapDClient, mapd.TSessionId, error) {
+func healthCheck(con *MapDCon) http.HandlerFunc {
+	fn := func(w http.ResponseWriter, r *http.Request) {
+		log.Println("Performing Healthcheck...")
+		if con.session == "" {
+			em := "Missing SessionId"
+			http.Error(w, em, 500)
+			log.Println("Healthcheck failed: " + em)
+		} else {
+			tbs, err := con.client.GetTables(con.session)
+			if err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			con.client.GetTables(con.session)
+			for i := 0; i < len(tbs); i++ {
+				res, err := con.client.SqlExecute(con.session, "SELECT COUNT(*) FROM " + tbs[i], true, "0", 1)
+				if err != nil {
+					http.Error(w, err.Error(), 500)
+					return
+				}
+				numRows := len(res.RowSet.Columns[0].Nulls)
+				numCols := len(res.RowSet.RowDesc)
+				for r := 0; r < numRows; r++ {
+					for c := 0; c < numCols; c++ {
+						fmt.Fprintf(w, "%s: %d\n", tbs[i], res.RowSet.Columns[c].Data.IntCol[r])
+					}
+				}
+			}
+			fmt.Fprintln(w, "OK")
+		}
+	}
+	return http.HandlerFunc(fn)
+}
+
+func handleSystemSignals(con *MapDCon) {
+	c := make(chan os.Signal, 2)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		sig := <-c
+		log.Println("Terminating due to signal: ", sig.String())
+		con.client.Disconnect(con.session)
+		con.client.Transport.Close()
+		os.Exit(1)
+	}()
+}
+
+func retry(attempts int, sleep time.Duration, action func() (*MapDCon, error)) (*MapDCon, error) {
 	var err error
-	var mapdClient *mapd.MapDClient
-	var sessionId mapd.TSessionId
+	var con *MapDCon
 	for i := 0; i < attempts; i++ {
-		mapdClient, sessionId, err = action()
+		con, err = action()
 		if err == nil {
-			return mapdClient, sessionId, err
+			return con, err
 		}
 		time.Sleep(sleep)
 		log.Println("retrying action after error: ", err)
 	}
-	return mapdClient, sessionId, err
+	return con, err
 }
 
 func options() opts {
