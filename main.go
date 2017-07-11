@@ -1,14 +1,10 @@
 package main
 
 import (
-	"git.apache.org/thrift.git/lib/go/thrift"
-	"github.com/shusson/mapd-api/thrift/e745367/mapd"
 	"net/url"
 	"log"
-	"net/http/httputil"
 	"net/http"
 	"io/ioutil"
-	"bytes"
 	"regexp"
 	"fmt"
 	"flag"
@@ -19,131 +15,103 @@ import (
 	"os/signal"
 	"github.com/gorilla/mux"
 	"encoding/json"
+	"github.com/garyburd/redigo/redis"
+	"github.com/shusson/mapd-api/redisutil"
+	"github.com/shusson/mapd-api/proxyutil"
+	"errors"
+	"github.com/shusson/mapd-api/mapdutil"
 )
 
 type opts struct {
-	url        string
+	url        *url.URL
 	user       string
 	db         string
 	pwd        string
 	httpPort   int
 	bufferSize int
-}
-
-type MapDCon struct {
-	client  *mapd.MapDClient
-	session mapd.TSessionId
-	options opts
-}
-
-type MapDConInfo struct {
-	Version string `json:"version"`
-	StartTime int64 `json:"start_time"`
-	ReadOnly bool `json:"read_only"`
+	redisURL   string
 }
 
 func main() {
 
-	options := options()
+	options, err := options()
+	if err != nil  {
+		log.Fatal("failed parse flag options: " + err.Error())
+	}
 
-	con, err := retry(60, 2*time.Second, func() (*MapDCon, error) {
-		log.Println("connecting to mapd server...")
-		return connectToMapD(options)
-	})
-	if err != nil || con.session == "" {
+	cache := redisutil.NewPool(options.redisURL)
+	defer cache.Close()
+
+	conn, err := mapdutil.ConnectToMapDWithRetry(options.user, options.pwd, options.db, options.url.String(), options.bufferSize, 60, 2*time.Second)
+	if err != nil || conn.Session == "" {
 		log.Fatal("failed to connect to mapd server")
 	}
 
-	defer con.client.Disconnect(con.session)
-	defer con.client.Transport.Close()
+	defer conn.Client.Disconnect(conn.Session)
+	defer conn.Client.Transport.Close()
 
-	handleSystemSignals(con)
+	sigHandler(conn, cache)
 
 	r := mux.NewRouter()
-	r.HandleFunc("/healthcheck", healthCheck(con))
-	r.HandleFunc("/", sessionProxy(con))
+	r.HandleFunc("/healthcheck", healthCheck(conn))
+	r.HandleFunc("/", handleThriftRequests(conn, cache, options))
 	http.Handle("/", r)
 
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", options.httpPort), r))
 }
 
-func sessionProxy(con *MapDCon) http.HandlerFunc {
-	serverUrl, err := url.Parse(con.options.url)
-	if err != nil {
-		log.Fatal("URL failed to parse")
-	}
-	reverseProxy := httputil.NewSingleHostReverseProxy(serverUrl)
-	modified := modifySession(reverseProxy, con)
-
-	return http.HandlerFunc(modified)
-}
-
-func modifySession(handler http.Handler, con *MapDCon) http.HandlerFunc {
-	nonce := 0
+func handleThriftRequests(conn *mapdutil.MapDCon, cache *redis.Pool, options opts) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		body, err := ioutil.ReadAll(r.Body)
-		if err == nil {
-			nonce++
-			b := string(body[:])
-			if strings.Contains(b, "sql_execute") {
-				re := regexp.MustCompile(`(\[\d,")(\w*)(",\d,\d,{"1":{"str":")(\w*)(".*},"2".*,"3".*,"4":{"str":")(\d*)("}.*,"5".*}\])`)
-				repl := fmt.Sprintf("${1}${2}${3}%s${5}%d${7}", con.session, nonce)
-				b = re.ReplaceAllString(b, repl)
-				body = []byte(b)
-				// when writing a request the http lib ignores the request header and reads from the ContentLength field
-				// http://tip.golang.org/pkg/net/http/#Request.Write
-				// https://github.com/golang/go/issues/7682
-				r.ContentLength = int64(len(b))
-			} else if strings.Contains(b, "get_table_details") {
-				re := regexp.MustCompile(`(.*{"str":")(\w{32})(.*)`)
-				repl := fmt.Sprintf("${1}%s${3}", con.session)
-				b = re.ReplaceAllString(b, repl)
-				body = []byte(b)
-				r.ContentLength = int64(len(b))
-			}
+		if err != nil {
+			http.Error(w, err.Error(), 502)
+			return
 		}
-		r.Body = ioutil.NopCloser(bytes.NewBuffer(body))
-		handler.ServeHTTP(w, r)
+		b := string(body[:])
+
+		if strings.Contains(b, "sql_execute") {
+			query, err := getSQLQuery(b)
+			if err != nil {
+				http.Error(w, err.Error(), 502)
+			}
+
+			result, err := redisutil.Get(cache, query)
+			if err != nil {
+				replaceSessionString(b, conn)
+				t := &proxyutil.Transport{RoundTripper: http.DefaultTransport, Key: query, Pool: cache}
+				proxyutil.ReverseProxy(w, r, []byte(b), options.url, t)
+			} else {
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+				w.Header().Set("Content-Type", "application/x-thrift")
+				fmt.Fprintln(w, string(result))
+			}
+		} else if strings.Contains(b, "get_table_details") {
+			replaceSessionString(b, conn)
+			t := &proxyutil.Transport{RoundTripper: http.DefaultTransport, Key: "", Pool: cache}
+			proxyutil.ReverseProxy(w, r, []byte(b), options.url, t)
+		} else {
+			t := &proxyutil.Transport{RoundTripper: http.DefaultTransport, Key: "", Pool: cache}
+			proxyutil.ReverseProxy(w, r, []byte(b), options.url, t)
+		}
 	}
 }
 
-func connectToMapD(options opts) (*MapDCon, error) {
-	protocolFactory := thrift.NewTJSONProtocolFactory()
-	transportFactory := thrift.NewTBufferedTransportFactory(options.bufferSize)
-	socket, err := thrift.NewTHttpPostClient(options.url)
-	if err != nil {
-		return nil, err
+func getSQLQuery(s string) (string, error){
+	re := regexp.MustCompile(`(.*,"2":{"str":")(.*)("},"3".*)`)
+	m := re.FindStringSubmatch(s)
+	if m == nil || len(m) != 4 {
+		return "", errors.New("Could not find SQL query in body of request")
 	}
-	transport, err := transportFactory.GetTransport(socket)
-	if err != nil {
-		return nil, err
-	}
-	if err := transport.Open(); err != nil {
-		return nil, err
-	}
-	client := mapd.NewMapDClientFactory(transport, protocolFactory)
-	sessionId, err := client.Connect(options.user, options.pwd, options.db)
-	if err != nil {
-		return nil, err
-	}
-
-	log.Println("connected to mapd server: ", sessionId)
-	con := &MapDCon{client, sessionId, options}
-	connectionInfo(con)
-	info, err := connectionInfo(con)
-	if err != nil {
-		return nil, err
-	}
-	jInfo, err := json.Marshal(info)
-	if err != nil {
-		return nil, err
-	}
-	log.Println(string(jInfo))
-
-	return con, err
+	return m[2], nil
 }
 
-func healthCheck(con *MapDCon) http.HandlerFunc {
+func replaceSessionString(s string, conn *mapdutil.MapDCon) string {
+	re := regexp.MustCompile(`(.*{"str":")(\w{32})(.*)`)
+	repl := fmt.Sprintf("${1}%s${3}", conn.Session)
+	return re.ReplaceAllString(s, repl)
+}
+
+func healthCheck(con *mapdutil.MapDCon) http.HandlerFunc {
 	handleError := func(w http.ResponseWriter, err error) error {
 		if err != nil {
 			http.Error(w, err.Error(), 500)
@@ -154,7 +122,7 @@ func healthCheck(con *MapDCon) http.HandlerFunc {
 
 	fn := func(w http.ResponseWriter, r *http.Request) {
 
-		info, err := connectionInfo(con)
+		info, err := mapdutil.ConnectionInfo(con)
 		if handleError(w, err) != nil {
 			return
 		}
@@ -168,59 +136,43 @@ func healthCheck(con *MapDCon) http.HandlerFunc {
 	return http.HandlerFunc(fn)
 }
 
-func connectionInfo(con *MapDCon) (*MapDConInfo, error) {
-	serverInfo, err := con.client.GetServerStatus(con.session)
-	if err != nil {
-		return nil, err
-	}
-	hcr := &MapDConInfo{ReadOnly: serverInfo.ReadOnly, StartTime: serverInfo.StartTime, Version: serverInfo.Version}
-	return hcr, nil
-}
-
-func handleSystemSignals(con *MapDCon) {
+func sigHandler(con *mapdutil.MapDCon, cache *redis.Pool) {
 	c := make(chan os.Signal, 2)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		sig := <-c
 		log.Println("Terminating due to signal: ", sig.String())
-		con.client.Disconnect(con.session)
-		con.client.Transport.Close()
+		con.Client.Disconnect(con.Session)
+		con.Client.Transport.Close()
+		cache.Close()
 		os.Exit(1)
 	}()
 }
 
-func retry(attempts int, sleep time.Duration, action func() (*MapDCon, error)) (*MapDCon, error) {
-	var err error
-	var con *MapDCon
-	for i := 0; i < attempts; i++ {
-		con, err = action()
-		if err == nil {
-			return con, err
-		}
-		time.Sleep(sleep)
-		log.Println("retrying action after error: ", err)
-	}
-	return con, err
-}
-
-func options() opts {
-	var mapdUrl string
+func options() (opts, error) {
+	var mapdURL string
 	var mapdUser string
 	var mapdDb string
 	var mapdPwd string
 	var httpPort int
 	var bufferSize int
-	flag.StringVar(&mapdUrl, "url", "http://127.0.0.1:80", "url to mapd-core server")
+	var cacheURL string
+	flag.StringVar(&mapdURL, "url", "http://127.0.0.1:80", "url to mapd-core server")
 	flag.StringVar(&mapdUser, "user", "mapd", "mapd user")
 	flag.StringVar(&mapdDb, "db", "mapd", "mapd database")
 	flag.StringVar(&mapdPwd, "pass", "HyperInteractive", "mapd pwd")
 	flag.IntVar(&httpPort, "http-port", 4000, "port to listen to incoming http connections")
 	flag.IntVar(&bufferSize, "b", 8192, "thrift transport buffer size")
+	flag.StringVar(&cacheURL, "redisURL", "localhost:6379", "URL to redis, if empty no cache is used")
 
 	flag.Usage = func() {
 		fmt.Printf("Usage of %s:\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-	return opts{mapdUrl, mapdUser, mapdDb, mapdPwd, httpPort, bufferSize}
+	serverURL, err := url.Parse(mapdURL)
+	if err != nil {
+		return opts{}, err
+	}
+	return opts{serverURL, mapdUser, mapdDb, mapdPwd, httpPort, bufferSize, cacheURL}, nil
 }
