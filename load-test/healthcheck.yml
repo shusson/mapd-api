@@ -1,0 +1,17 @@
+config:
+  target: 'http://localhost:4000'
+  phases:
+    - duration: 3
+      arrivalRate: 100
+  http:
+    tls:
+      rejectUnauthorized: false
+
+scenarios:
+  - flow:
+    - get:
+        url: "/healthcheck"
+        capture:
+          json: $
+          as: "response"
+    - log: "{{ response }}"

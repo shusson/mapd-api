@@ -6,23 +6,25 @@ import (
 	"log"
 	"encoding/json"
 	"time"
+	"sync"
 )
 
-// MapDCon wrapper around mapd client
-type MapDCon struct {
+// MapDConn wrapper around mapd client
+type MapDConn struct {
 	Client  *mapd.MapDClient
 	Session mapd.TSessionId
+	Mu sync.Mutex
 }
 
-// MapDConInfo mapd connection info
-type MapDConInfo struct {
+// MapDConnInfo mapd connection info
+type MapDConnInfo struct {
 	Version   string `json:"version"`
 	StartTime int64 `json:"start_time"`
 	ReadOnly  bool `json:"read_only"`
 }
 
 // ConnectToMapD connect to mapd core server
-func ConnectToMapD(user string, pwd string, db string, url string, bufferSize int) (*MapDCon, error) {
+func ConnectToMapD(user string, pwd string, db string, url string, bufferSize int) (*MapDConn, error) {
 	protocolFactory := thrift.NewTJSONProtocolFactory()
 	transportFactory := thrift.NewTBufferedTransportFactory(bufferSize)
 	socket, err := thrift.NewTHttpPostClient(url)
@@ -43,9 +45,9 @@ func ConnectToMapD(user string, pwd string, db string, url string, bufferSize in
 	}
 
 	log.Println("connected to mapd server: ", sessionID)
-	con := &MapDCon{client, sessionID}
-	ConnectionInfo(con)
-	info, err := ConnectionInfo(con)
+	conn := &MapDConn{Client: client, Session: sessionID}
+	ConnectionInfo(conn)
+	info, err := ConnectionInfo(conn)
 	if err != nil {
 		return nil, err
 	}
@@ -55,30 +57,30 @@ func ConnectToMapD(user string, pwd string, db string, url string, bufferSize in
 	}
 	log.Println(string(jInfo))
 
-	return con, err
+	return conn, err
 }
 
 // ConnectToMapDWithRetry connect to mapd core server with a retry
-func ConnectToMapDWithRetry(user string, pwd string, db string, url string, bufferSize int, attempts int, sleep time.Duration) (*MapDCon, error) {
-	return retry(attempts, sleep, func() (*MapDCon, error) {
+func ConnectToMapDWithRetry(user string, pwd string, db string, url string, bufferSize int, attempts int, sleep time.Duration) (*MapDConn, error) {
+	return retry(attempts, sleep, func() (*MapDConn, error) {
 		log.Println("connecting to mapd server...")
 		return ConnectToMapD(user, pwd, db, url, bufferSize)
 	})
 }
 
 // ConnectionInfo get mapd connection info
-func ConnectionInfo(con *MapDCon) (*MapDConInfo, error) {
+func ConnectionInfo(con *MapDConn) (*MapDConnInfo, error) {
 	serverInfo, err := con.Client.GetServerStatus(con.Session)
 	if err != nil {
 		return nil, err
 	}
-	hcr := &MapDConInfo{ReadOnly: serverInfo.ReadOnly, StartTime: serverInfo.StartTime, Version: serverInfo.Version}
+	hcr := &MapDConnInfo{ReadOnly: serverInfo.ReadOnly, StartTime: serverInfo.StartTime, Version: serverInfo.Version}
 	return hcr, nil
 }
 
-func retry(attempts int, sleep time.Duration, action func() (*MapDCon, error)) (*MapDCon, error) {
+func retry(attempts int, sleep time.Duration, action func() (*MapDConn, error)) (*MapDConn, error) {
 	var err error
-	var con *MapDCon
+	var con *MapDConn
 	for i := 0; i < attempts; i++ {
 		con, err = action()
 		if err == nil {
