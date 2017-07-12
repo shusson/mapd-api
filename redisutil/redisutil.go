@@ -6,12 +6,12 @@ import (
 )
 
 // NewPool construct a new redis pool
-func NewPool(redisURL string) *redis.Pool {
+func NewPool(redisAddress string) *redis.Pool {
 	return &redis.Pool{
 		MaxIdle:     10,
 		IdleTimeout: 100 * time.Second,
 		Dial: func() (redis.Conn, error) {
-			conn, err := redis.Dial("tcp", redisURL)
+			conn, err := redis.Dial("tcp", redisAddress)
 			if err != nil {
 				return nil, err
 			}

@@ -23,13 +23,13 @@ import (
 )
 
 type opts struct {
-	url        *url.URL
-	user       string
-	db         string
-	pwd        string
-	httpPort   int
-	bufferSize int
-	redisURL   string
+	url          *url.URL
+	user         string
+	db           string
+	pwd          string
+	httpPort     int
+	bufferSize   int
+	redisAddress string
 }
 
 func main() {
@@ -39,7 +39,7 @@ func main() {
 		log.Fatal("failed parse flag options: " + err.Error())
 	}
 
-	cache := redisutil.NewPool(options.redisURL)
+	cache := redisutil.NewPool(options.redisAddress)
 	defer cache.Close()
 
 	conn, err := mapdutil.ConnectToMapDWithRetry(options.user, options.pwd, options.db, options.url.String(), options.bufferSize, 60, 2*time.Second)
@@ -155,14 +155,14 @@ func options() (opts, error) {
 	var mapdPwd string
 	var httpPort int
 	var bufferSize int
-	var cacheURL string
+	var redisAddress string
 	flag.StringVar(&mapdURL, "url", "http://127.0.0.1:80", "url to mapd-core server")
 	flag.StringVar(&mapdUser, "user", "mapd", "mapd user")
 	flag.StringVar(&mapdDb, "db", "mapd", "mapd database")
 	flag.StringVar(&mapdPwd, "pass", "HyperInteractive", "mapd pwd")
 	flag.IntVar(&httpPort, "http-port", 4000, "port to listen to incoming http connections")
 	flag.IntVar(&bufferSize, "b", 8192, "thrift transport buffer size")
-	flag.StringVar(&cacheURL, "redisURL", "localhost:6379", "URL to redis, if empty no cache is used")
+	flag.StringVar(&redisAddress, "redis", "localhost:6379", "TCP address of redis, if empty no cache is used")
 
 	flag.Usage = func() {
 		fmt.Printf("Usage of %s:\n", os.Args[0])
@@ -173,5 +173,5 @@ func options() (opts, error) {
 	if err != nil {
 		return opts{}, err
 	}
-	return opts{serverURL, mapdUser, mapdDb, mapdPwd, httpPort, bufferSize, cacheURL}, nil
+	return opts{serverURL, mapdUser, mapdDb, mapdPwd, httpPort, bufferSize, redisAddress}, nil
 }
