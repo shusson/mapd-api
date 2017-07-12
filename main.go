@@ -54,13 +54,13 @@ func main() {
 
 	r := mux.NewRouter()
 	r.HandleFunc("/healthcheck", healthCheck(conn))
-	r.HandleFunc("/", handleThriftRequests(conn, cache, options))
+	r.HandleFunc("/", handleThriftRequests(string(conn.Session), cache, options))
 	http.Handle("/", r)
 
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", options.httpPort), r))
 }
 
-func handleThriftRequests(conn *mapdutil.MapDCon, cache *redis.Pool, options opts) http.HandlerFunc {
+func handleThriftRequests(sessionID string, cache *redis.Pool, options opts) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		body, err := ioutil.ReadAll(r.Body)
 		if err != nil {
@@ -77,7 +77,7 @@ func handleThriftRequests(conn *mapdutil.MapDCon, cache *redis.Pool, options opt
 
 			result, err := redisutil.Get(cache, query)
 			if err != nil {
-				replaceSessionString(b, conn)
+				replaceSession(b, sessionID)
 				t := &proxyutil.Transport{RoundTripper: http.DefaultTransport, Key: query, Pool: cache}
 				proxyutil.ReverseProxy(w, r, []byte(b), options.url, t)
 			} else {
@@ -86,7 +86,7 @@ func handleThriftRequests(conn *mapdutil.MapDCon, cache *redis.Pool, options opt
 				fmt.Fprintln(w, string(result))
 			}
 		} else if strings.Contains(b, "get_table_details") {
-			replaceSessionString(b, conn)
+			replaceSession(b, sessionID)
 			t := &proxyutil.Transport{RoundTripper: http.DefaultTransport, Key: "", Pool: cache}
 			proxyutil.ReverseProxy(w, r, []byte(b), options.url, t)
 		} else {
@@ -105,13 +105,13 @@ func getSQLQuery(s string) (string, error){
 	return m[2], nil
 }
 
-func replaceSessionString(s string, conn *mapdutil.MapDCon) string {
+func replaceSession(s string, sessionID string) string {
 	re := regexp.MustCompile(`(.*{"str":")(\w{32})(.*)`)
-	repl := fmt.Sprintf("${1}%s${3}", conn.Session)
+	repl := fmt.Sprintf("${1}%s${3}", sessionID)
 	return re.ReplaceAllString(s, repl)
 }
 
-func healthCheck(con *mapdutil.MapDCon) http.HandlerFunc {
+func healthCheck(conn *mapdutil.MapDConn) http.HandlerFunc {
 	handleError := func(w http.ResponseWriter, err error) error {
 		if err != nil {
 			http.Error(w, err.Error(), 500)
@@ -121,8 +121,8 @@ func healthCheck(con *mapdutil.MapDCon) http.HandlerFunc {
 	}
 
 	fn := func(w http.ResponseWriter, r *http.Request) {
-
-		info, err := mapdutil.ConnectionInfo(con)
+		conn.Mu.Lock()
+		info, err := mapdutil.ConnectionInfo(conn)
 		if handleError(w, err) != nil {
 			return
 		}
@@ -130,20 +130,21 @@ func healthCheck(con *mapdutil.MapDCon) http.HandlerFunc {
 		if handleError(w, err) != nil {
 			return
 		}
+		conn.Mu.Unlock()
 		fmt.Fprintln(w, string(jInfo))
 		log.Println("Healthcheck passed - " + string(jInfo))
 	}
 	return http.HandlerFunc(fn)
 }
 
-func sigHandler(con *mapdutil.MapDCon, cache *redis.Pool) {
+func sigHandler(conn *mapdutil.MapDConn, cache *redis.Pool) {
 	c := make(chan os.Signal, 2)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		sig := <-c
 		log.Println("Terminating due to signal: ", sig.String())
-		con.Client.Disconnect(con.Session)
-		con.Client.Transport.Close()
+		conn.Client.Disconnect(conn.Session)
+		conn.Client.Transport.Close()
 		cache.Close()
 		os.Exit(1)
 	}()
