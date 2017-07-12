@@ -17,7 +17,7 @@ type Transport struct {
 	Pool *redis.Pool
 }
 
-// RoundTrip {{inheritDoc}}
+// RoundTrip intercept the response from mapd and cache the value in redis
 func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error) {
 	resp, err = t.RoundTripper.RoundTrip(req)
 	if err != nil {
@@ -50,6 +50,8 @@ func ReverseProxy(w http.ResponseWriter, r *http.Request, body []byte, serverURL
 	r.ContentLength = int64(len(body))
 	r.Body = ioutil.NopCloser(bytes.NewBuffer(body))
 	handler := httputil.NewSingleHostReverseProxy(serverURL)
-	handler.Transport = t
+	if t != nil {
+		handler.Transport = t
+	}
 	handler.ServeHTTP(w, r)
 }

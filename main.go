@@ -18,8 +18,8 @@ import (
 	"github.com/garyburd/redigo/redis"
 	"github.com/shusson/mapd-api/redisutil"
 	"github.com/shusson/mapd-api/proxyutil"
-	"errors"
 	"github.com/shusson/mapd-api/mapdutil"
+	"errors"
 )
 
 type opts struct {
@@ -87,11 +87,9 @@ func handleThriftRequests(sessionID string, cache *redis.Pool, options opts) htt
 			}
 		} else if strings.Contains(b, "get_table_details") {
 			replaceSession(b, sessionID)
-			t := &proxyutil.Transport{RoundTripper: http.DefaultTransport, Key: "", Pool: cache}
-			proxyutil.ReverseProxy(w, r, []byte(b), options.url, t)
+			proxyutil.ReverseProxy(w, r, []byte(b), options.url, nil)
 		} else {
-			t := &proxyutil.Transport{RoundTripper: http.DefaultTransport, Key: "", Pool: cache}
-			proxyutil.ReverseProxy(w, r, []byte(b), options.url, t)
+			proxyutil.ReverseProxy(w, r, []byte(b), options.url, nil)
 		}
 	}
 }
