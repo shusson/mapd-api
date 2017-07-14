@@ -77,17 +77,17 @@ func handleThriftRequests(sessionID string, cache *redis.Pool, options opts) htt
 
 			result, err := redisutil.Get(cache, query)
 			if err != nil {
-				replaceSession(b, sessionID)
+				mb := replaceSession(b, sessionID)
 				t := &proxyutil.Transport{RoundTripper: http.DefaultTransport, Key: query, Pool: cache}
-				proxyutil.ReverseProxy(w, r, []byte(b), options.url, t)
+				proxyutil.ReverseProxy(w, r, []byte(mb), options.url, t)
 			} else {
 				w.Header().Set("Access-Control-Allow-Origin", "*")
 				w.Header().Set("Content-Type", "application/x-thrift")
 				fmt.Fprintln(w, string(result))
 			}
 		} else if strings.Contains(b, "get_table_details") {
-			replaceSession(b, sessionID)
-			proxyutil.ReverseProxy(w, r, []byte(b), options.url, nil)
+			mb := replaceSession(b, sessionID)
+			proxyutil.ReverseProxy(w, r, []byte(mb), options.url, nil)
 		} else {
 			proxyutil.ReverseProxy(w, r, []byte(b), options.url, nil)
 		}
